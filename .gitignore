@@ -1,0 +1,21 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local OCR inputs, outputs, and packaged artifacts
+images/
+extracted_text/
+*.zip
+*.pdf
+*.doc
+*.docx
+*.xlsx
+*.xlsm
+*.xltx
+*.xltm
+
+# OS/editor files
+.DS_Store
+Thumbs.db

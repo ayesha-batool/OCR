@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Universal Text Extractor</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="header">
+        <div class="header-inner">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <div class="brand-text">
+              <h1 class="title">Universal Text Extractor</h1>
+              <p class="subtitle">
+                Upload a document and get clean extracted text in seconds.
+              </p>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main class="main">
+        <div class="card">
+          <section class="section" aria-labelledby="upload-heading">
+            <h2 id="upload-heading" class="section-heading">Source file</h2>
+            <p class="section-hint">Supported: common image types, PDF, DOC/DOCX, XLSX.</p>
+
+            <label class="dropzone" for="fileInput">
+              <input id="fileInput" type="file" accept="image/*,.pdf,.doc,.docx,.xlsx,.xlsm,.xltx,.xltm" />
+              <span class="dropzone-icon" aria-hidden="true">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="17 8 12 3 7 8" />
+                  <line x1="12" y1="3" x2="12" y2="15" />
+                </svg>
+              </span>
+              <span class="dropzone-label">Choose file</span>
+              <span class="dropzone-meta">or drag and drop (browser permitting)</span>
+            </label>
+
+            <div class="toolbar">
+              <button type="button" id="extractBtn" class="btn btn-primary" disabled>
+                Extract text
+              </button>
+              <button type="button" id="copyBtn" class="btn btn-secondary" disabled>
+                Copy to clipboard
+              </button>
+            </div>
+
+            <p id="fileName" class="file-name" role="status">No file selected</p>
+          </section>
+
+          <div class="divider" role="presentation"></div>
+
+          <section class="section section-output" aria-labelledby="output-heading">
+            <div class="output-header">
+              <h2 id="output-heading" class="section-heading">Extracted text</h2>
+            </div>
+            <pre id="output" class="output" tabindex="0">Text will appear here after extraction.</pre>
+          </section>
+        </div>
+      </main>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
