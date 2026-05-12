@@ -410,6 +410,16 @@ async def home() -> FileResponse:
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
+@app.get("/styles.css")
+async def styles() -> FileResponse:
+    return FileResponse(str(STATIC_DIR / "styles.css"))
+
+
+@app.get("/app.js")
+async def app_script() -> FileResponse:
+    return FileResponse(str(STATIC_DIR / "app.js"))
+
+
 @app.post("/api/extract")
 async def extract_text(
     file: UploadFile = File(...)
