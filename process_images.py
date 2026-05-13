@@ -192,7 +192,8 @@ def process_image(path: Path) -> str:
 
 import re
 
-EXTRACTED_TEXT_DIR = BASE_DIR / "extracted_text"
+OUTPUT_BASE_DIR = Path(tempfile.gettempdir()) if os.getenv("VERCEL") else BASE_DIR
+EXTRACTED_TEXT_DIR = OUTPUT_BASE_DIR / "extracted_text"
 
 
 def _build_output_txt_path(original_filename: str) -> Path:
