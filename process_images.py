@@ -190,8 +190,6 @@ def process_image(path: Path) -> str:
     text = _extract_with_gemini(path)
     return text.strip()
 
-import re
-
 OUTPUT_BASE_DIR = Path(tempfile.gettempdir()) if os.getenv("VERCEL") else BASE_DIR
 EXTRACTED_TEXT_DIR = OUTPUT_BASE_DIR / "extracted_text"
 
@@ -204,19 +202,6 @@ def _build_output_txt_path(original_filename: str) -> Path:
     return EXTRACTED_TEXT_DIR / txt_name
 
 
-def _read_existing_output(path: Path) -> str:
-    if not path.exists():
-        return ""
-    return path.read_text(encoding="utf-8", errors="ignore")
-
-
-def _last_saved_pdf_page(existing_text: str) -> int:
-    matches = re.findall(r"--- Page (\d+) ---", existing_text)
-    if not matches:
-        return 0
-    return max(int(page) for page in matches)
-
-
 def _append_page_block(path: Path, block: str) -> None:
     separator = ""
     if path.exists() and path.stat().st_size > 0:
@@ -227,6 +212,47 @@ def _append_page_block(path: Path, block: str) -> None:
 
 def _write_full_text(path: Path, text: str) -> None:
     path.write_text(text or "", encoding="utf-8")
+
+
+def _extract_pdf_page_text(page) -> str:
+    words = page.get_text("words", sort=True) or []
+    if not words:
+        return ""
+
+    lines: list[list[tuple[float, str]]] = []
+    current_line: list[tuple[float, str]] = []
+    current_y: float | None = None
+    line_tolerance = 3.0
+
+    for word in words:
+        x0, y0, _x1, _y1, text = word[:5]
+        if current_y is None or abs(y0 - current_y) <= line_tolerance:
+            current_line.append((float(x0), str(text)))
+            current_y = float(y0) if current_y is None else current_y
+            continue
+
+        lines.append(current_line)
+        current_line = [(float(x0), str(text))]
+        current_y = float(y0)
+
+    if current_line:
+        lines.append(current_line)
+
+    page_lines: list[str] = []
+    for line in lines:
+        line.sort(key=lambda item: item[0])
+        rendered = ""
+        last_column = 0
+
+        for x0, text in line:
+            column = max(0, round(x0 / 4))
+            spaces = max(1, column - last_column)
+            rendered += (" " * spaces) + text if rendered else (" " * column) + text
+            last_column = column + len(text)
+
+        page_lines.append(rendered.rstrip())
+
+    return "\n".join(line for line in page_lines if line.strip()).strip()
 
 
 def extract_from_pdf(file_bytes: bytes, original_filename: str) -> str:
@@ -249,21 +275,14 @@ def extract_from_pdf(file_bytes: bytes, original_filename: str) -> str:
 
     total_pages = len(doc)
     output_txt_path = _build_output_txt_path(original_filename)
-    existing_text = _read_existing_output(output_txt_path)
-    resume_from_page = _last_saved_pdf_page(existing_text)
+    if output_txt_path.exists():
+        output_txt_path.unlink()
 
-    full_text: list[str] = [existing_text.strip()] if existing_text.strip() else []
+    full_text: list[str] = []
 
     try:
 
-        if resume_from_page >= total_pages:
-            print(
-                f"✅ Resume detected: all {total_pages} pages already saved in "
-                f"{output_txt_path.name}"
-            )
-            return existing_text.strip()
-
-        for page_number in range(resume_from_page, total_pages):
+        for page_number in range(total_pages):
 
             actual_page = page_number + 1
 
@@ -271,10 +290,8 @@ def extract_from_pdf(file_bytes: bytes, original_filename: str) -> str:
 
             page = doc.load_page(page_number)
 
-            # Try normal PDF text extraction first
-            native_text = (
-                page.get_text("text") or ""
-            ).strip()
+            # Extract by visual position so headings stay before tables and table columns remain readable.
+            native_text = _extract_pdf_page_text(page)
 
             page_text = native_text
 
