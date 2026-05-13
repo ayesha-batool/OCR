@@ -4,6 +4,8 @@ const fileName = document.getElementById("fileName");
 const output = document.getElementById("output");
 const copyBtn = document.getElementById("copyBtn");
 
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
+
 let selectedFile = null;
 let extractedText = "";
 
@@ -18,6 +20,11 @@ fileInput.addEventListener("change", (event) => {
 extractBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
 
+  if (selectedFile.size > MAX_UPLOAD_BYTES) {
+    output.textContent = "Error: File is too large for Vercel upload. Please try a file smaller than 4 MB.";
+    return;
+  }
+
   extractBtn.disabled = true;
   copyBtn.disabled = true;
   output.textContent = "Extracting text…";
@@ -28,7 +35,14 @@ extractBtn.addEventListener("click", async () => {
 
   try {
     const response = await fetch("/api/extract", { method: "POST", body: formData });
-    const data = await response.json();
+    const responseText = await response.text();
+    let data = {};
+    try {
+      data = responseText ? JSON.parse(responseText) : {};
+    } catch {
+      throw new Error(responseText || "Server returned a non-JSON response.");
+    }
+
     if (!response.ok) {
       throw new Error(data.detail || "Extraction failed.");
     }
