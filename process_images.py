@@ -1,8 +1,11 @@
 import os
 import re
 import tempfile
+import threading
 import time
+import asyncio
 from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -26,7 +29,58 @@ LEGACY_WORD_EXTENSIONS = {".doc"}
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
 
 # Matches page headers written by extract_from_pdf (one block per PDF page).
-_PAGE_HEADER_RE = re.compile(r"^--- Page (\d+) ---$", re.MULTILINE)
+_PAGE_HEADER_RE = re.compile(r"^--- Page (\d+) ---\s*$", re.MULTILINE)
+
+_OCR_PROMPT = (
+    "Strict OCR only. Copy every character visible in the image exactly as printed.\n"
+    "Output ONLY the raw text from the image in reading order (Arabic, Urdu, English, numbers).\n"
+    "Preserve line breaks, punctuation, spelling mistakes, and repeated words exactly.\n"
+    "Do NOT translate, summarize, paraphrase, or fix spelling/grammar.\n"
+    "FORBIDDEN in your reply — do not output any of these:\n"
+    "- Role, Task, Constraints, Block, or descriptions of the image or layout\n"
+    "- Labels you invent such as Arabic:, Urdu:, Block 1, or bullet lists of rules\n"
+    "- Commentary, reasoning, double-checking, or repeating these instructions\n"
+    "- Markdown formatting, asterisks, or meta text about what you are doing\n"
+    "If a word like Arabic or Urdu is not printed in the image, do not write it.\n"
+    "Reply with extracted text only. No other words before or after.\n"
+)
+
+_OCR_META_LINE_RE = re.compile(
+    r"^\s*(\*+\s*)?"
+    r"(Role\s*:|Task\s*:|Constraints?\s*:|Block\s+\d+\s*:|"
+    r"The image contains|No translation|No fixing|Output ONLY|"
+    r"Preserve original|Keep Urdu|Do NOT translate|Do not output|"
+    r"FORBIDDEN|REQUIRED|Strict OCR|Extract text VERBATIM)"
+    r".*$",
+    re.IGNORECASE,
+)
+_OCR_LABEL_PREFIX_RE = re.compile(r"^\s*(Arabic|Urdu)\s*:\s*", re.IGNORECASE)
+
+
+def _sanitize_ocr_output(text: str) -> str:
+    """Drop Gemini meta-commentary; keep verbatim lines from the page."""
+    if not text or not text.strip():
+        return text
+
+    cleaned: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            cleaned.append("")
+            continue
+        if _OCR_META_LINE_RE.match(stripped):
+            continue
+        if _OCR_LABEL_PREFIX_RE.match(stripped):
+            stripped = _OCR_LABEL_PREFIX_RE.sub("", stripped).strip()
+            if not stripped:
+                continue
+        cleaned.append(line)
+
+    result = "\n".join(cleaned).strip()
+    while "\n\n\n" in result:
+        result = result.replace("\n\n\n", "\n\n")
+    return result
+
 
 # Gemini (used for image extraction)
 FREE_MODELS = [
@@ -71,8 +125,11 @@ FREE_MODELS = [
 
    
 ]
-API_KEYS = [os.getenv(f"GEMINI_API_KEY_{i}") for i in range(10, 12)]
+API_KEYS = [os.getenv(f"GEMINI_API_KEY_{i}") for i in range(2, 12)]
 API_KEYS = [k for k in API_KEYS if k]
+PARALLEL_WORKERS = max(1, min(8, int(os.getenv("PARALLEL_WORKERS", "4"))))
+_LOG_LOCK = threading.Lock()
+_FILE_WRITE_LOCK = threading.Lock()
 PROCESSOR_POST_ENDPOINT = os.getenv("PROCESSOR_POST_ENDPOINT", "").strip()
 PROCESSOR_GET_ENDPOINT = os.getenv("PROCESSOR_GET_ENDPOINT", "").strip()
 
@@ -102,13 +159,41 @@ class ProcessExtractedPayload(BaseModel):
     text: str
 
 
-def _extract_with_gemini(path: Path) -> str:
-    print(f"\n📸 Image: {path.name}")
+def _log(message: str) -> None:
+    with _LOG_LOCK:
+        print(message, flush=True)
+
+
+def _api_key_label(api_key: str | None) -> str:
+    if not api_key:
+        return "none"
+    try:
+        slot = API_KEYS.index(api_key) + 1
+        return f"GEMINI_API_KEY_{slot}"
+    except ValueError:
+        return "custom"
+
+
+def _extract_with_gemini(
+    path: Path,
+    *,
+    preferred_api_key: str | None = None,
+    worker_id: int | None = None,
+    page_label: str = "",
+) -> str:
+    worker_tag = f"[Worker {worker_id}] " if worker_id is not None else ""
+    page_tag = f"{page_label} " if page_label else ""
+    _log(f"\n{worker_tag}📸 {page_tag}OCR {path.name}")
 
     if not API_KEYS:
         raise RuntimeError("Gemini API keys not configured. Set GEMINI_API_KEY_1..GEMINI_API_KEY_7.")
     if not FREE_MODELS:
         raise RuntimeError("No Gemini models configured.")
+
+    keys_to_try: list[str] = []
+    if preferred_api_key and preferred_api_key in API_KEYS:
+        keys_to_try.append(preferred_api_key)
+    keys_to_try.extend(k for k in API_KEYS if k not in keys_to_try)
 
     image_b64 = b64encode(path.read_bytes()).decode("utf-8")
 
@@ -121,22 +206,7 @@ def _extract_with_gemini(path: Path) -> str:
             {
                 "role": "user",
                 "parts": [
-                    {
-                        "text": (
-                            "You are a strict OCR engine.\n"
-                            "Extract text VERBATIM from the image.\n"
-                            "Rules (must follow exactly):\n"
-                            "- Do NOT translate, summarize, or paraphrase\n"
-                            "- Do NOT fix spelling/grammar\n"
-                            "- Keep Urdu/Arabic exactly as written\n"
-                            "- Preserve original line breaks and punctuation\n"
-                            "- Preserve repeated words and apparent mistakes\n"
-                                  "dont write anything other than final output, add no workin like double checking or rewriting rules and i want exact text"
-                            "i dont want checking. i only want text which is extracted \n" 
-                            "dont rewrite rules or double check or add any explanation. just give me the text which is in image and nothing else\n"
-                            "- Output ONLY extracted text, no explanation"
-                        )
-                    },
+                    {"text": _OCR_PROMPT},
                     {"inline_data": {"mime_type": mime, "data": image_b64}},
                 ],
             }
@@ -152,9 +222,10 @@ def _extract_with_gemini(path: Path) -> str:
 
     last_error: Exception | None = None
 
-    for api_index, api_key in enumerate(API_KEYS, start=1):
+    for api_key in keys_to_try:
+        key_label = _api_key_label(api_key)
         for model in FREE_MODELS:
-            print(f"🔑 API {api_index} | 🤖 {model}")
+            _log(f"{worker_tag}🔑 {key_label} | 🤖 {model}")
             try:
                 r = requests.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
@@ -162,9 +233,9 @@ def _extract_with_gemini(path: Path) -> str:
                     json=body,
                     timeout=120,
                 )
-                print(f"🌐 Status: {r.status_code}")
+                _log(f"{worker_tag}🌐 {key_label} | Status: {r.status_code}")
                 if r.status_code == 429:
-                    print("🚫 Rate limit -> trying next key/model")
+                    _log(f"{worker_tag}🚫 {key_label} rate limit -> next key/model")
                     continue
                 r.raise_for_status()
                 data = r.json()
@@ -176,26 +247,88 @@ def _extract_with_gemini(path: Path) -> str:
                     .strip()
                 )
                 if text:
-                    print("\n================ OCR OUTPUT ================")
-                    print(text)
-                    print("===========================================\n")
+                    text = _sanitize_ocr_output(text)
+                    if not text:
+                        _log(f"{worker_tag}⚠️ Empty after removing OCR meta from {key_label}")
+                        continue
+                    preview = text[:120].replace("\n", " ")
+                    _log(f"{worker_tag}✅ {page_tag}OCR done ({len(text)} chars): {preview}…")
                     return text
-                print("⚠️ Empty response")
+                _log(f"{worker_tag}⚠️ Empty response from {key_label}")
             except Exception as exc:
-                print(f"❌ Exception: {exc}")
+                _log(f"{worker_tag}❌ {key_label} exception: {exc}")
                 last_error = exc
                 continue
 
     if last_error:
-        print("❌ Failed image")
+        _log(f"{worker_tag}❌ OCR failed for {path.name}")
         raise RuntimeError(f"Gemini extraction failed across all model/API combinations: {last_error}") from last_error
-    print("❌ Failed image")
+    _log(f"{worker_tag}❌ OCR failed for {path.name}")
     raise RuntimeError("Gemini extraction failed across all model/API combinations.")
 
 
-def process_image(path: Path) -> str:
-    text = _extract_with_gemini(path)
+def process_image(
+    path: Path,
+    *,
+    preferred_api_key: str | None = None,
+    worker_id: int | None = None,
+    page_label: str = "",
+) -> str:
+    text = _extract_with_gemini(
+        path,
+        preferred_api_key=preferred_api_key,
+        worker_id=worker_id,
+        page_label=page_label,
+    )
     return text.strip()
+
+
+def _process_pdf_page(
+    file_bytes: bytes,
+    page_number: int,
+    total_pages: int,
+    *,
+    worker_id: int,
+    page_writer: "_OrderedPageWriter",
+    preferred_api_key: str | None = None,
+) -> tuple[int, str]:
+    """Extract one PDF page in a worker thread (opens its own document handle)."""
+    import fitz
+
+    actual_page = page_number + 1
+    page_label = f"page {actual_page}/{total_pages}"
+    key_label = _api_key_label(preferred_api_key)
+    _log(f"[Worker {worker_id}] ▶ Started {page_label} ({key_label})")
+
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        page = doc.load_page(page_number)
+        page_text = _extract_pdf_page_text(page)
+
+        if not page_text:
+            _log(f"[Worker {worker_id}] 🖼 {page_label} → Gemini OCR")
+            pix = page.get_pixmap(alpha=False)
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                temp_path = Path(tmp.name)
+            try:
+                pix.save(str(temp_path))
+                page_text = process_image(
+                    temp_path,
+                    preferred_api_key=preferred_api_key,
+                    worker_id=worker_id,
+                    page_label=page_label,
+                ).strip()
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
+        else:
+            _log(f"[Worker {worker_id}] 📄 {page_label} → native text")
+
+        formatted_text = f"--- Page {actual_page} ---\n{page_text or ''}"
+        page_writer.add(actual_page, formatted_text)
+        return actual_page, formatted_text
+    finally:
+        doc.close()
 
 
 def _use_temp_output_dir() -> bool:
@@ -208,12 +341,17 @@ EXTRACTED_TEXT_DIR = OUTPUT_BASE_DIR / "extracted_text"
 
 
 def _highest_page_marked_in_txt(path: Path) -> int:
-    """Return the largest page number found in an extracted .txt, or 0 if none."""
+    """Return the highest page N such that pages 1..N are all present (safe for resume)."""
     if not path.exists() or path.stat().st_size == 0:
         return 0
     text = path.read_text(encoding="utf-8", errors="replace")
-    nums = [int(m) for m in _PAGE_HEADER_RE.findall(text)]
-    return max(nums) if nums else 0
+    page_nums = {int(m) for m in _PAGE_HEADER_RE.findall(text)}
+    if not page_nums:
+        return 0
+    contiguous = 0
+    while (contiguous + 1) in page_nums:
+        contiguous += 1
+    return contiguous
 
 
 def _build_output_txt_path(original_filename: str) -> Path:
@@ -228,8 +366,53 @@ def _append_page_block(path: Path, block: str) -> None:
     separator = ""
     if path.exists() and path.stat().st_size > 0:
         separator = "\n\n"
-    with path.open("a", encoding="utf-8") as out_file:
-        out_file.write(f"{separator}{block}")
+    with _FILE_WRITE_LOCK:
+        with path.open("a", encoding="utf-8") as out_file:
+            out_file.write(f"{separator}{block}")
+            out_file.flush()
+            try:
+                os.fsync(out_file.fileno())
+            except OSError:
+                pass
+
+
+class _OrderedPageWriter:
+    """Buffer parallel page results; append to disk when each page is the next in sequence."""
+
+    def __init__(self, path: Path, last_saved_page: int) -> None:
+        self.path = path.resolve()
+        self.next_page = last_saved_page + 1
+        self._buffer: dict[int, str] = {}
+        self._lock = threading.Lock()
+
+    def add(self, page_num: int, block: str) -> None:
+        with self._lock:
+            self._buffer[page_num] = block
+            if page_num == self.next_page:
+                self._flush_ready_locked()
+            elif page_num > self.next_page:
+                _log(
+                    f"⏳ Page {page_num} extracted — waiting for page {self.next_page} "
+                    f"before writing to {self.path.name}"
+                )
+
+    def _flush_ready_locked(self) -> None:
+        while self.next_page in self._buffer:
+            block = self._buffer.pop(self.next_page)
+            _append_page_block(self.path, block)
+            _log(f"💾 Saved page {self.next_page} → {self.path}")
+            self.next_page += 1
+
+    def flush(self) -> None:
+        with self._lock:
+            if not self._buffer:
+                return
+            pending = sorted(self._buffer)
+            _log(
+                f"⚠️ Could not save {len(pending)} page(s) yet — "
+                f"still waiting for page {self.next_page}: {pending[:8]}"
+                f"{'…' if len(pending) > 8 else ''}"
+            )
 
 
 def _write_full_text(path: Path, text: str) -> None:
@@ -291,13 +474,11 @@ def extract_from_pdf(file_bytes: bytes, original_filename: str) -> tuple[str, in
             "Install pymupdf."
         ) from exc
 
-    # Open PDF from memory
-    doc = fitz.open(
-        stream=file_bytes,
-        filetype="pdf"
-    )
-
+    # Open PDF once to get page count (each worker opens its own handle).
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
     total_pages = len(doc)
+    doc.close()
+
     output_txt_path = _build_output_txt_path(original_filename)
     already_done = _highest_page_marked_in_txt(output_txt_path)
 
@@ -311,7 +492,6 @@ def extract_from_pdf(file_bytes: bytes, original_filename: str) -> tuple[str, in
             f"{output_txt_path.name}; skipping extraction."
         )
         final_text = output_txt_path.read_text(encoding="utf-8").strip()
-        doc.close()
         return final_text, total_pages
 
     if output_txt_path.exists() and already_done == 0:
@@ -324,64 +504,39 @@ def extract_from_pdf(file_bytes: bytes, original_filename: str) -> tuple[str, in
             f"{output_txt_path.name}; starting at page {already_done + 1}."
         )
 
-    try:
+    pending_pages = [page_number for page_number in range(total_pages) if page_number + 1 > already_done]
+    page_writer = _OrderedPageWriter(output_txt_path, already_done)
 
-        for page_number in range(total_pages):
+    if pending_pages:
+        workers = min(PARALLEL_WORKERS, len(pending_pages))
+        _log(
+            f"\n⚡ Parallel mode: {workers} worker thread(s), "
+            f"{len(API_KEYS)} API key(s), {len(pending_pages)} page(s) to process"
+        )
+        _log(f"📁 Incremental save → {output_txt_path.resolve()}")
+        _log(f"📌 Next page to write: {page_writer.next_page}")
+        if workers == 1:
+            _log("⚠️ Only 1 worker active — set PARALLEL_WORKERS=4 in .env for more speed")
 
-            actual_page = page_number + 1
-
-            if actual_page <= already_done:
-                continue
-
-            print(f"\n📄 Processing Page {actual_page}/{total_pages}")
-
-            page = doc.load_page(page_number)
-
-            # Extract by visual position so headings stay before tables and table columns remain readable.
-            native_text = _extract_pdf_page_text(page)
-
-            page_text = native_text
-
-            # If no text found -> OCR image page
-            if not page_text:
-
-                print(
-                    f"🖼 OCR image-based PDF page "
-                    f"{actual_page}/{total_pages}"
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(
+                    _process_pdf_page,
+                    file_bytes,
+                    page_number,
+                    total_pages,
+                    worker_id=(idx % workers) + 1,
+                    page_writer=page_writer,
+                    preferred_api_key=API_KEYS[idx % len(API_KEYS)] if API_KEYS else None,
                 )
+                for idx, page_number in enumerate(pending_pages)
+            ]
 
-                pix = page.get_pixmap(alpha=False)
+            for future in as_completed(futures):
+                actual_page, _formatted_text = future.result()
+                _log(f"✅ Finished page {actual_page}/{total_pages}")
 
-                with tempfile.NamedTemporaryFile(
-                    suffix=".png",
-                    delete=False
-                ) as tmp:
-
-                    temp_path = Path(tmp.name)
-
-                try:
-
-                    pix.save(str(temp_path))
-
-                    page_text = (
-                        process_image(temp_path) or ""
-                    ).strip()
-
-                finally:
-
-                    if temp_path.exists():
-                        temp_path.unlink()
-
-            formatted_text = (
-                f"--- Page {actual_page} ---\n"
-                f"{page_text or ''}"
-            )
-
-            _append_page_block(output_txt_path, formatted_text)
-
-    finally:
-
-        doc.close()
+        page_writer.flush()
 
     final_text = output_txt_path.read_text(encoding="utf-8").strip()
 
@@ -546,9 +701,10 @@ async def extract_text(
         # =========================
         elif suffix in PDF_EXTENSIONS:
 
-            text, total_pages = extract_from_pdf(
+            text, total_pages = await asyncio.to_thread(
+                extract_from_pdf,
                 content,
-                file.filename
+                file.filename,
             )
             pages_extracted = total_pages
 
