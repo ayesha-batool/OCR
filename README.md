@@ -23,3 +23,20 @@ uvicorn process_images:app --reload
 ```
 
 Open `http://127.0.0.1:8000` in your browser.
+
+## Deploy on Render
+
+This app is configured for [Render](https://render.com). Connect the GitHub repo and Render will use `render.yaml`:
+
+- **Build:** `pip install -r requirements.txt`
+- **Start:** `uvicorn process_images:app --host 0.0.0.0 --port $PORT`
+
+Set environment variables in the Render dashboard (same as local `.env`):
+
+```env
+GEMINI_API_KEY_10=your_key
+GEMINI_API_KEY_11=your_key
+CORS_ORIGINS=https://your-frontend.onrender.com
+```
+
+On Render, extracted text is written to `/tmp` (ephemeral). For local runs, files are saved under `extracted_text/`.

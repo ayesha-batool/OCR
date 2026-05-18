@@ -197,7 +197,13 @@ def process_image(path: Path) -> str:
     text = _extract_with_gemini(path)
     return text.strip()
 
-OUTPUT_BASE_DIR = Path(tempfile.gettempdir()) if os.getenv("VERCEL") else BASE_DIR
+
+def _use_temp_output_dir() -> bool:
+    """Use /tmp on cloud hosts (Render, etc.) where the app dir is not writable."""
+    return bool(os.getenv("RENDER") or os.getenv("VERCEL"))
+
+
+OUTPUT_BASE_DIR = Path(tempfile.gettempdir()) if _use_temp_output_dir() else BASE_DIR
 EXTRACTED_TEXT_DIR = OUTPUT_BASE_DIR / "extracted_text"
 
 
