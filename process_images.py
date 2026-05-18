@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import time
 from base64 import b64encode
@@ -24,8 +25,8 @@ WORD_EXTENSIONS = {".docx"}
 LEGACY_WORD_EXTENSIONS = {".doc"}
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
 
-
-
+# Matches page headers written by extract_from_pdf (one block per PDF page).
+_PAGE_HEADER_RE = re.compile(r"^--- Page (\d+) ---$", re.MULTILINE)
 
 # Gemini (used for image extraction)
 FREE_MODELS = [
@@ -70,17 +71,24 @@ FREE_MODELS = [
 
    
 ]
-API_KEYS = [os.getenv(f"GEMINI_API_KEY_{i}") for i in range(1, 12)]
+API_KEYS = [os.getenv(f"GEMINI_API_KEY_{i}") for i in range(10, 12)]
 API_KEYS = [k for k in API_KEYS if k]
 PROCESSOR_POST_ENDPOINT = os.getenv("PROCESSOR_POST_ENDPOINT", "").strip()
 PROCESSOR_GET_ENDPOINT = os.getenv("PROCESSOR_GET_ENDPOINT", "").strip()
+
+
+def _cors_origins(default: str = "http://localhost:4200") -> list[str]:
+    raw = os.getenv("CORS_ORIGINS", default).strip()
+    if raw == "*":
+        return ["*"]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
 app = FastAPI(title="Universal Text Extractor", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4200"],
+    allow_origins=_cors_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -92,7 +100,6 @@ class SendExtractedPayload(BaseModel):
 
 class ProcessExtractedPayload(BaseModel):
     text: str
-
 
 
 def _extract_with_gemini(path: Path) -> str:
@@ -194,6 +201,15 @@ OUTPUT_BASE_DIR = Path(tempfile.gettempdir()) if os.getenv("VERCEL") else BASE_D
 EXTRACTED_TEXT_DIR = OUTPUT_BASE_DIR / "extracted_text"
 
 
+def _highest_page_marked_in_txt(path: Path) -> int:
+    """Return the largest page number found in an extracted .txt, or 0 if none."""
+    if not path.exists() or path.stat().st_size == 0:
+        return 0
+    text = path.read_text(encoding="utf-8", errors="replace")
+    nums = [int(m) for m in _PAGE_HEADER_RE.findall(text)]
+    return max(nums) if nums else 0
+
+
 def _build_output_txt_path(original_filename: str) -> Path:
     """Create deterministic output path: <original filename>.txt"""
     source_name = Path(original_filename).name
@@ -219,43 +235,45 @@ def _extract_pdf_page_text(page) -> str:
     if not words:
         return ""
 
-    lines: list[list[tuple[float, str]]] = []
-    current_line: list[tuple[float, str]] = []
+    lines: list[list[tuple[float, float, float, str]]] = []
+    current_line: list[tuple[float, float, float, str]] = []
     current_y: float | None = None
-    line_tolerance = 3.0
+    line_tolerance = 4.0
 
     for word in words:
-        x0, y0, _x1, _y1, text = word[:5]
+        x0, y0, x1, _y1, text = word[:5]
         if current_y is None or abs(y0 - current_y) <= line_tolerance:
-            current_line.append((float(x0), str(text)))
+            current_line.append((float(x0), float(y0), float(x1), str(text)))
             current_y = float(y0) if current_y is None else current_y
             continue
 
         lines.append(current_line)
-        current_line = [(float(x0), str(text))]
+        current_line = [(float(x0), float(y0), float(x1), str(text))]
         current_y = float(y0)
 
     if current_line:
         lines.append(current_line)
 
+    lines.sort(key=lambda line: (min(item[1] for item in line), min(item[0] for item in line)))
+
     page_lines: list[str] = []
     for line in lines:
         line.sort(key=lambda item: item[0])
-        rendered = ""
-        last_column = 0
+        rendered_parts: list[str] = []
+        previous_x1: float | None = None
 
-        for x0, text in line:
-            column = max(0, round(x0 / 4))
-            spaces = max(1, column - last_column)
-            rendered += (" " * spaces) + text if rendered else (" " * column) + text
-            last_column = column + len(text)
+        for x0, _y0, x1, text in line:
+            if previous_x1 is not None and x0 - previous_x1 > 28:
+                rendered_parts.append("|")
+            rendered_parts.append(text)
+            previous_x1 = x1
 
-        page_lines.append(rendered.rstrip())
+        page_lines.append(" ".join(rendered_parts).strip())
 
     return "\n".join(line for line in page_lines if line.strip()).strip()
 
 
-def extract_from_pdf(file_bytes: bytes, original_filename: str) -> str:
+def extract_from_pdf(file_bytes: bytes, original_filename: str) -> tuple[str, int]:
 
     try:
         import fitz
@@ -275,16 +293,39 @@ def extract_from_pdf(file_bytes: bytes, original_filename: str) -> str:
 
     total_pages = len(doc)
     output_txt_path = _build_output_txt_path(original_filename)
-    if output_txt_path.exists():
+    already_done = _highest_page_marked_in_txt(output_txt_path)
+
+    if already_done > total_pages:
+        output_txt_path.unlink()
+        already_done = 0
+
+    if already_done >= total_pages:
+        print(
+            f"\n⏩ All {total_pages} page(s) already in "
+            f"{output_txt_path.name}; skipping extraction."
+        )
+        final_text = output_txt_path.read_text(encoding="utf-8").strip()
+        doc.close()
+        return final_text, total_pages
+
+    if output_txt_path.exists() and already_done == 0:
+        # Leftover file without our page markers (e.g. old format) — avoid appending duplicates.
         output_txt_path.unlink()
 
-    full_text: list[str] = []
+    if already_done > 0:
+        print(
+            f"\n⏩ Resuming: pages 1–{already_done} already in "
+            f"{output_txt_path.name}; starting at page {already_done + 1}."
+        )
 
     try:
 
         for page_number in range(total_pages):
 
             actual_page = page_number + 1
+
+            if actual_page <= already_done:
+                continue
 
             print(f"\n📄 Processing Page {actual_page}/{total_pages}")
 
@@ -331,16 +372,16 @@ def extract_from_pdf(file_bytes: bytes, original_filename: str) -> str:
             )
 
             _append_page_block(output_txt_path, formatted_text)
-            full_text.append(formatted_text)
 
     finally:
 
         doc.close()
 
-    # Final combined text
-    final_text = "\n\n".join(full_text).strip()
+    final_text = output_txt_path.read_text(encoding="utf-8").strip()
 
-    return final_text
+    return final_text, total_pages
+
+
 def extract_from_docx(file_bytes: bytes) -> str:
     try:
         from docx import Document
@@ -464,6 +505,8 @@ async def extract_text(
         )
 
     output_txt_path = _build_output_txt_path(file.filename)
+    total_pages: int | None = None
+    pages_extracted: int | None = None
 
     try:
 
@@ -497,10 +540,11 @@ async def extract_text(
         # =========================
         elif suffix in PDF_EXTENSIONS:
 
-            text = extract_from_pdf(
+            text, total_pages = extract_from_pdf(
                 content,
                 file.filename
             )
+            pages_extracted = total_pages
 
         # =========================
         # DOCX FILES
@@ -555,6 +599,8 @@ async def extract_text(
             "filename": file.filename,
             "characters": len(text or ""),
             "text": text or "",
+            "pages_extracted": pages_extracted,
+            "total_pages": total_pages,
             "structured_rows": [],
             "table_html": [],
         }

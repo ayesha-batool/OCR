@@ -57,6 +57,15 @@
             </div>
 
             <p id="fileName" class="file-name" role="status">No file selected</p>
+            <div id="progressWrap" class="progress-wrap" hidden>
+              <div class="progress-meta">
+                <span id="progressLabel">Preparing upload...</span>
+                <span id="progressPercent">0%</span>
+              </div>
+              <div class="progress-track" aria-hidden="true">
+                <div id="progressBar" class="progress-bar"></div>
+              </div>
+            </div>
           </section>
 
           <div class="divider" role="presentation"></div>
