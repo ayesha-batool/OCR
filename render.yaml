@@ -7,3 +7,5 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
+      - key: CORS_ORIGINS
+        value: "http://localhost:4200,https://www.steamx.pk,https://steamx.pk,https://steamx-v1-backend.onrender.com,https://ocr-9e8w.onrender.com"

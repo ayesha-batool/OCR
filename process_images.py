@@ -134,11 +134,20 @@ PROCESSOR_POST_ENDPOINT = os.getenv("PROCESSOR_POST_ENDPOINT", "").strip()
 PROCESSOR_GET_ENDPOINT = os.getenv("PROCESSOR_GET_ENDPOINT", "").strip()
 
 
-def _cors_origins(default: str = "http://localhost:4200") -> list[str]:
+_DEFAULT_CORS_ORIGINS = (
+    "http://localhost:4200,"
+    "https://www.steamx.pk,"
+    "https://steamx.pk,"
+    "https://steamx-v1-backend.onrender.com,"
+    "https://ocr-9e8w.onrender.com"
+)
+
+
+def _cors_origins(default: str = _DEFAULT_CORS_ORIGINS) -> list[str]:
     raw = os.getenv("CORS_ORIGINS", default).strip()
     if raw == "*":
         return ["*"]
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
 
 
 app = FastAPI(title="Universal Text Extractor", version="1.0.0")
