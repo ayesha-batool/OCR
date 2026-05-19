@@ -125,7 +125,7 @@ FREE_MODELS = [
 
    
 ]
-API_KEYS = [os.getenv(f"GEMINI_API_KEY_{i}") for i in range(2, 12)]
+API_KEYS = [os.getenv(f"GEMINI_API_KEY_{i}") for i in range(1, 12)]
 API_KEYS = [k for k in API_KEYS if k]
 PARALLEL_WORKERS = max(1, min(8, int(os.getenv("PARALLEL_WORKERS", "4"))))
 _LOG_LOCK = threading.Lock()
@@ -289,7 +289,7 @@ def _process_pdf_page(
     total_pages: int,
     *,
     worker_id: int,
-    page_writer: "_OrderedPageWriter",
+    page_writer: "_InPlacePageWriter",
     preferred_api_key: str | None = None,
 ) -> tuple[int, str]:
     """Extract one PDF page in a worker thread (opens its own document handle)."""
@@ -340,18 +340,50 @@ OUTPUT_BASE_DIR = Path(tempfile.gettempdir()) if _use_temp_output_dir() else BAS
 EXTRACTED_TEXT_DIR = OUTPUT_BASE_DIR / "extracted_text"
 
 
-def _highest_page_marked_in_txt(path: Path) -> int:
-    """Return the highest page N such that pages 1..N are all present (safe for resume)."""
+def _pages_marked_in_txt(path: Path) -> set[int]:
+    """Return all page numbers that already have a --- Page N --- block in the txt."""
     if not path.exists() or path.stat().st_size == 0:
-        return 0
+        return set()
     text = path.read_text(encoding="utf-8", errors="replace")
-    page_nums = {int(m) for m in _PAGE_HEADER_RE.findall(text)}
-    if not page_nums:
-        return 0
-    contiguous = 0
-    while (contiguous + 1) in page_nums:
-        contiguous += 1
-    return contiguous
+    return {int(m) for m in _PAGE_HEADER_RE.findall(text)}
+
+
+def _missing_page_numbers(present: set[int], total_pages: int) -> list[int]:
+    return [n for n in range(1, total_pages + 1) if n not in present]
+
+
+def _parse_page_blocks_from_txt(path: Path) -> dict[int, str]:
+    """Split an extracted txt into {page_number: '--- Page N ---\\n...'} blocks."""
+    if not path.exists() or path.stat().st_size == 0:
+        return {}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    matches = list(_PAGE_HEADER_RE.finditer(text))
+    if not matches:
+        return {}
+
+    pages: dict[int, str] = {}
+    for index, match in enumerate(matches):
+        page_num = int(match.group(1))
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        block = text[start:end].strip()
+        if block:
+            pages[page_num] = block
+    return pages
+
+
+def _write_ordered_pages(path: Path, pages: dict[int, str]) -> None:
+    """Rewrite the txt with all known pages sorted 1, 2, 3, … (correct physical order)."""
+    ordered = [pages[page_num] for page_num in sorted(pages)]
+    content = "\n\n".join(ordered)
+    with _FILE_WRITE_LOCK:
+        path.write_text(content, encoding="utf-8")
+        with path.open("rb+") as out_file:
+            out_file.flush()
+            try:
+                os.fsync(out_file.fileno())
+            except OSError:
+                pass
 
 
 def _build_output_txt_path(original_filename: str) -> Path:
@@ -362,57 +394,31 @@ def _build_output_txt_path(original_filename: str) -> Path:
     return EXTRACTED_TEXT_DIR / txt_name
 
 
-def _append_page_block(path: Path, block: str) -> None:
-    separator = ""
-    if path.exists() and path.stat().st_size > 0:
-        separator = "\n\n"
-    with _FILE_WRITE_LOCK:
-        with path.open("a", encoding="utf-8") as out_file:
-            out_file.write(f"{separator}{block}")
-            out_file.flush()
-            try:
-                os.fsync(out_file.fileno())
-            except OSError:
-                pass
+class _InPlacePageWriter:
+    """Keep pages in memory and rewrite the txt in page order after each new page."""
 
-
-class _OrderedPageWriter:
-    """Buffer parallel page results; append to disk when each page is the next in sequence."""
-
-    def __init__(self, path: Path, last_saved_page: int) -> None:
+    def __init__(self, path: Path, *, total_pages: int, initial_pages: dict[int, str]) -> None:
         self.path = path.resolve()
-        self.next_page = last_saved_page + 1
-        self._buffer: dict[int, str] = {}
+        self.total_pages = total_pages
+        self._pages = dict(initial_pages)
         self._lock = threading.Lock()
+        if self._pages:
+            _write_ordered_pages(self.path, self._pages)
+            _log(f"📑 Sorted {len(self._pages)} existing page(s) into correct order")
 
     def add(self, page_num: int, block: str) -> None:
         with self._lock:
-            self._buffer[page_num] = block
-            if page_num == self.next_page:
-                self._flush_ready_locked()
-            elif page_num > self.next_page:
-                _log(
-                    f"⏳ Page {page_num} extracted — waiting for page {self.next_page} "
-                    f"before writing to {self.path.name}"
-                )
-
-    def _flush_ready_locked(self) -> None:
-        while self.next_page in self._buffer:
-            block = self._buffer.pop(self.next_page)
-            _append_page_block(self.path, block)
-            _log(f"💾 Saved page {self.next_page} → {self.path}")
-            self.next_page += 1
+            if page_num in self._pages:
+                return
+            self._pages[page_num] = block.strip()
+            _write_ordered_pages(self.path, self._pages)
+            _log(
+                f"💾 Saved page {page_num}/{self.total_pages} "
+                f"in order ({len(self._pages)} pages in file) → {self.path.name}"
+            )
 
     def flush(self) -> None:
-        with self._lock:
-            if not self._buffer:
-                return
-            pending = sorted(self._buffer)
-            _log(
-                f"⚠️ Could not save {len(pending)} page(s) yet — "
-                f"still waiting for page {self.next_page}: {pending[:8]}"
-                f"{'…' if len(pending) > 8 else ''}"
-            )
+        return
 
 
 def _write_full_text(path: Path, text: str) -> None:
@@ -480,32 +486,43 @@ def extract_from_pdf(file_bytes: bytes, original_filename: str) -> tuple[str, in
     doc.close()
 
     output_txt_path = _build_output_txt_path(original_filename)
-    already_done = _highest_page_marked_in_txt(output_txt_path)
+    existing_pages = _parse_page_blocks_from_txt(output_txt_path)
+    pages_on_disk = set(existing_pages)
 
-    if already_done > total_pages:
+    if pages_on_disk and max(pages_on_disk) > total_pages:
         output_txt_path.unlink()
-        already_done = 0
+        existing_pages = {}
+        pages_on_disk = set()
 
-    if already_done >= total_pages:
-        print(
+    missing_nums = _missing_page_numbers(pages_on_disk, total_pages)
+    if not missing_nums:
+        _log(
             f"\n⏩ All {total_pages} page(s) already in "
             f"{output_txt_path.name}; skipping extraction."
         )
         final_text = output_txt_path.read_text(encoding="utf-8").strip()
         return final_text, total_pages
 
-    if output_txt_path.exists() and already_done == 0:
+    if output_txt_path.exists() and not pages_on_disk:
         # Leftover file without our page markers (e.g. old format) — avoid appending duplicates.
         output_txt_path.unlink()
+        missing_nums = list(range(1, total_pages + 1))
 
-    if already_done > 0:
-        print(
-            f"\n⏩ Resuming: pages 1–{already_done} already in "
-            f"{output_txt_path.name}; starting at page {already_done + 1}."
+    if pages_on_disk:
+        preview = ", ".join(str(n) for n in missing_nums[:12])
+        if len(missing_nums) > 12:
+            preview += ", …"
+        _log(
+            f"\n⏩ Resume: {len(pages_on_disk)} page(s) already saved, "
+            f"{len(missing_nums)} missing — will extract only: {preview}"
         )
 
-    pending_pages = [page_number for page_number in range(total_pages) if page_number + 1 > already_done]
-    page_writer = _OrderedPageWriter(output_txt_path, already_done)
+    pending_pages = [page_number for page_number in range(total_pages) if (page_number + 1) in missing_nums]
+    page_writer = _InPlacePageWriter(
+        output_txt_path,
+        total_pages=total_pages,
+        initial_pages=existing_pages,
+    )
 
     if pending_pages:
         workers = min(PARALLEL_WORKERS, len(pending_pages))
@@ -513,8 +530,8 @@ def extract_from_pdf(file_bytes: bytes, original_filename: str) -> tuple[str, in
             f"\n⚡ Parallel mode: {workers} worker thread(s), "
             f"{len(API_KEYS)} API key(s), {len(pending_pages)} page(s) to process"
         )
-        _log(f"📁 Incremental save → {output_txt_path.resolve()}")
-        _log(f"📌 Next page to write: {page_writer.next_page}")
+        _log(f"📁 Incremental save (sorted by page) → {output_txt_path.resolve()}")
+        _log(f"📌 Pages already in file: {len(existing_pages)}")
         if workers == 1:
             _log("⚠️ Only 1 worker active — set PARALLEL_WORKERS=4 in .env for more speed")
 
