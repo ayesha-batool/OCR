@@ -134,21 +134,43 @@ PROCESSOR_POST_ENDPOINT = os.getenv("PROCESSOR_POST_ENDPOINT", "").strip()
 PROCESSOR_GET_ENDPOINT = os.getenv("PROCESSOR_GET_ENDPOINT", "").strip()
 
 
-def _cors_origins(default: str = "https://www.steamx.pk,http://localhost:4200") -> list[str]:
-    raw = os.getenv("CORS_ORIGINS", default).strip()
+_DEFAULT_CORS_ORIGINS = (
+    "http://localhost:4200,"
+    "http://localhost:4201,"
+    "https://www.steamx.pk,"
+    "https://steamx.pk"
+)
+
+# Always allow Steamx + local dev even if Render CORS_ORIGINS is empty or wrong.
+_STEAMX_ORIGIN_REGEX = r"https://(www\.)?steamx\.pk$|http://localhost(:\d+)?$"
+
+
+def _cors_origins(default: str = _DEFAULT_CORS_ORIGINS) -> list[str]:
+    raw = os.getenv("CORS_ORIGINS")
+    if raw is None or not str(raw).strip():
+        raw = default
+    else:
+        raw = str(raw).strip()
     if raw == "*":
         return ["*"]
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    origins = [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+    if not origins:
+        origins = [origin.strip().rstrip("/") for origin in default.split(",") if origin.strip()]
+    return origins
 
+
+_ALLOWED_CORS_ORIGINS = _cors_origins()
 
 app = FastAPI(title="Universal Text Extractor", version="1.0.0")
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins(),
+    allow_origins=_ALLOWED_CORS_ORIGINS,
+    allow_origin_regex=_STEAMX_ORIGIN_REGEX,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 class SendExtractedPayload(BaseModel):
     endpoint: HttpUrl
@@ -162,6 +184,12 @@ class ProcessExtractedPayload(BaseModel):
 def _log(message: str) -> None:
     with _LOG_LOCK:
         print(message, flush=True)
+
+
+@app.on_event("startup")
+async def _log_cors_config() -> None:
+    _log(f"CORS allow_origins: {_ALLOWED_CORS_ORIGINS}")
+    _log(f"CORS allow_origin_regex: {_STEAMX_ORIGIN_REGEX}")
 
 
 def _api_key_label(api_key: str | None) -> str:
