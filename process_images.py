@@ -130,6 +130,13 @@ API_KEYS = [k for k in API_KEYS if k]
 PARALLEL_WORKERS = max(1, min(8, int(os.getenv("PARALLEL_WORKERS", "4"))))
 _LOG_LOCK = threading.Lock()
 _FILE_WRITE_LOCK = threading.Lock()
+
+
+def _log(message: str) -> None:
+    with _LOG_LOCK:
+        print(message, flush=True)
+
+
 PROCESSOR_POST_ENDPOINT = os.getenv("PROCESSOR_POST_ENDPOINT", "").strip()
 PROCESSOR_GET_ENDPOINT = os.getenv("PROCESSOR_GET_ENDPOINT", "").strip()
 
@@ -142,19 +149,35 @@ _DEFAULT_CORS_ORIGINS = (
     "https://ocr-9e8w.onrender.com"
 )
 
+# Fallback when Render env is empty/wrong — still allows Steamx + local dev.
+_STEAMX_CORS_REGEX = r"https://(www\.)?steamx\.pk|http://localhost(:\d+)?"
+
 
 def _cors_origins(default: str = _DEFAULT_CORS_ORIGINS) -> list[str]:
-    raw = os.getenv("CORS_ORIGINS", default).strip()
+    raw = os.getenv("CORS_ORIGINS")
+    if raw is None or not raw.strip():
+        raw = default
+    else:
+        raw = raw.strip()
     if raw == "*":
         return ["*"]
-    return [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+    origins = [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+    if not origins:
+        origins = [origin.strip().rstrip("/") for origin in default.split(",") if origin.strip()]
+    return origins
+
+
+_ALLOWED_ORIGINS = _cors_origins()
+_log(f"CORS allowed origins: {', '.join(_ALLOWED_ORIGINS)}")
+_log(f"CORS origin regex: {_STEAMX_CORS_REGEX}")
 
 
 app = FastAPI(title="Universal Text Extractor", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins(),
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_origin_regex=_STEAMX_CORS_REGEX,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -166,11 +189,6 @@ class SendExtractedPayload(BaseModel):
 
 class ProcessExtractedPayload(BaseModel):
     text: str
-
-
-def _log(message: str) -> None:
-    with _LOG_LOCK:
-        print(message, flush=True)
 
 
 def _api_key_label(api_key: str | None) -> str:
